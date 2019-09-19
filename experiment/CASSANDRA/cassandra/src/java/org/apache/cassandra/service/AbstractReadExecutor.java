@@ -62,22 +62,33 @@ public abstract class AbstractReadExecutor
     protected final List<InetAddress> targetReplicas;
     protected final ReadCallback handler;
     protected final TraceState traceState;
+    protected static final boolean allowReadDigest = Boolean.valueOf(System.getProperty("allowReadDigest", "False"));
 
+    /**
+     * + knob of digest read:
+     * + AllowReadDigest: the official way: One full read + digest read for the rest.
+     * + If not allowed, users can select the way of full read in required number of replicas.
+     */
     AbstractReadExecutor(Keyspace keyspace, ReadCommand command, ConsistencyLevel consistencyLevel, List<InetAddress> targetReplicas)
     {
         this.command = command;
         this.targetReplicas = targetReplicas;
-        this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
         this.traceState = Tracing.instance.get();
-
-        // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
-        // knows how to produce older digest but the reverse is not true.
-        // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
-        // we stop being compatible with pre-3.0 nodes.
-        int digestVersion = MessagingService.current_version;
-        for (InetAddress replica : targetReplicas)
-            digestVersion = Math.min(digestVersion, MessagingService.instance().getVersion(replica));
-        command.setDigestVersion(digestVersion);
+        // + knob of digest read.
+        if (!allowReadDigest){
+            this.handler = new ReadCallback(new DataResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
+        }
+        else{
+            this.handler = new ReadCallback(new DigestResolver(keyspace, command, consistencyLevel, targetReplicas.size()), consistencyLevel, command, targetReplicas);
+            // Set the digest version (if we request some digests). This is the smallest version amongst all our target replicas since new nodes
+            // knows how to produce older digest but the reverse is not true.
+            // TODO: we need this when talking with pre-3.0 nodes. So if we preserve the digest format moving forward, we can get rid of this once
+            // we stop being compatible with pre-3.0 nodes.
+            int digestVersion = MessagingService.current_version;
+            for (InetAddress replica : targetReplicas)
+                digestVersion = Math.min(digestVersion, MessagingService.instance().getVersion(replica));
+            command.setDigestVersion(digestVersion);
+        }
     }
 
     protected void makeDataRequests(Iterable<InetAddress> endpoints)
@@ -154,6 +165,7 @@ public abstract class AbstractReadExecutor
         List<InetAddress> allReplicas = StorageProxy.getLiveSortedEndpoints(keyspace, command.partitionKey());
         ReadRepairDecision repairDecision = command.metadata().newReadRepairDecision();
         List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
+        logger.info("AbstractReadExecutor: All replicas: {}. repairDecision:{}. Target replicas:{}", allReplicas, repairDecision, targetReplicas);
 
         // Throw UAE early if we don't have enough replicas.
         consistencyLevel.assureSufficientLiveNodes(keyspace, targetReplicas);
@@ -209,12 +221,22 @@ public abstract class AbstractReadExecutor
             super(keyspace, command, consistencyLevel, targetReplicas);
         }
 
+
         public void executeAsync()
         {
-            makeDataRequests(targetReplicas.subList(0, 1));
-            if (targetReplicas.size() > 1)
-                makeDigestRequests(targetReplicas.subList(1, targetReplicas.size()));
+            // + knob of digest read.
+            if (!allowReadDigest){
+                makeDataRequests(targetReplicas.subList(0, targetReplicas.size()));
+            }
+            else{
+                makeDataRequests(targetReplicas.subList(0, 1));
+                if (targetReplicas.size() > 1)
+                    makeDigestRequests(targetReplicas.subList(1, targetReplicas.size()));
+            }
+
         }
+
+
 
         public void maybeTryAdditionalReplicas()
         {
@@ -248,6 +270,12 @@ public abstract class AbstractReadExecutor
             // that the last replica in our list is "extra."
             List<InetAddress> initialReplicas = targetReplicas.subList(0, targetReplicas.size() - 1);
 
+            // if digest read is forbidden.
+            if (!allowReadDigest){
+                makeDataRequests(targetReplicas.subList(0, initialReplicas.size()));
+                return;
+            }
+
             if (handler.blockfor < initialReplicas.size())
             {
                 // We're hitting additional targets for read repair.  Since our "extra" replica is the least-
@@ -277,7 +305,11 @@ public abstract class AbstractReadExecutor
             {
                 // Could be waiting on the data, or on enough digests.
                 ReadCommand retryCommand = command;
-                if (handler.resolver.isDataPresent())
+                // if digest read is forbidden.
+                if (!allowReadDigest){
+                    retryCommand = command.copy().setIsDigestQuery(false);
+                }
+                else if (handler.resolver.isDataPresent())
                     retryCommand = command.copy().setIsDigestQuery(true);
 
                 InetAddress extraReplica = Iterables.getLast(targetReplicas);
@@ -327,6 +359,11 @@ public abstract class AbstractReadExecutor
         @Override
         public void executeAsync()
         {
+            // if digest read is forbidden
+            if (!allowReadDigest){
+                makeDataRequests(targetReplicas.subList(0, targetReplicas.size()));
+                return;
+            }
             makeDataRequests(targetReplicas.subList(0, targetReplicas.size() > 1 ? 2 : 1));
             if (targetReplicas.size() > 2)
                 makeDigestRequests(targetReplicas.subList(2, targetReplicas.size()));
